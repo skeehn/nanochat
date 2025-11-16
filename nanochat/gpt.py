@@ -14,6 +14,7 @@ Notable features:
 import math
 from functools import partial
 from dataclasses import dataclass
+from typing import Optional, Tuple, List, Generator
 
 import torch
 import torch.nn as nn
@@ -33,12 +34,22 @@ class GPTConfig:
     n_embd: int = 768
 
 
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
+def norm(x: torch.Tensor) -> torch.Tensor:
+    """Purely functional RMSNorm with no learnable params."""
     return F.rms_norm(x, (x.size(-1),))
 
 
-def apply_rotary_emb(x, cos, sin):
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary positional embeddings to input tensor.
+
+    Args:
+        x: Input tensor of shape (B, T, H, D) for multihead attention
+        cos: Cosine values for rotary embeddings
+        sin: Sine values for rotary embeddings
+
+    Returns:
+        Tensor with rotary embeddings applied, same shape as input
+    """
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
@@ -49,8 +60,18 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 
-def repeat_kv(x, n_rep):
-    """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat key/value heads to match query heads (for Multi-Query Attention).
+
+    Equivalent to torch.repeat_interleave(x, dim=1, repeats=n_rep) but more efficient.
+
+    Args:
+        x: Input tensor of shape (B, n_kv_heads, T, D)
+        n_rep: Number of times to repeat each KV head
+
+    Returns:
+        Tensor of shape (B, n_kv_heads * n_rep, T, D)
+    """
     if n_rep == 1:
         return x
     bs, n_kv_heads, slen, head_dim = x.shape
@@ -76,7 +97,18 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x: torch.Tensor, cos_sin: Tuple[torch.Tensor, torch.Tensor],
+                kv_cache: Optional['KVCache']) -> torch.Tensor:
+        """Forward pass for causal self-attention.
+
+        Args:
+            x: Input tensor of shape (B, T, C)
+            cos_sin: Tuple of (cos, sin) tensors for rotary embeddings
+            kv_cache: Optional KV cache for efficient inference
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -132,7 +164,15 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using ReLU^2 activation.
+
+        Args:
+            x: Input tensor of shape (B, T, C)
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
@@ -145,7 +185,18 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x: torch.Tensor, cos_sin: Tuple[torch.Tensor, torch.Tensor],
+                kv_cache: Optional['KVCache']) -> torch.Tensor:
+        """Forward pass for a transformer block with pre-norm.
+
+        Args:
+            x: Input tensor of shape (B, T, C)
+            cos_sin: Tuple of (cos, sin) tensors for rotary embeddings
+            kv_cache: Optional KV cache for efficient inference
+
+        Returns:
+            Output tensor of shape (B, T, C)
+        """
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         x = x + self.mlp(norm(x))
         return x
@@ -214,18 +265,37 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
-    def get_device(self):
+    def get_device(self) -> torch.device:
+        """Get the device where the model is located."""
         return self.transformer.wte.weight.device
 
-    def estimate_flops(self):
-        """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
+    def estimate_flops(self) -> int:
+        """Return the estimated FLOPs per token for the model.
+
+        Reference: https://arxiv.org/abs/2204.02311
+
+        Returns:
+            Number of FLOPs per token
+        """
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+    def setup_optimizers(self, unembedding_lr: float = 0.004, embedding_lr: float = 0.2,
+                        matrix_lr: float = 0.02, weight_decay: float = 0.0) -> List[torch.optim.Optimizer]:
+        """Setup dual optimizer strategy: AdamW for embeddings, Muon for matrices.
+
+        Args:
+            unembedding_lr: Learning rate for lm_head (output projection)
+            embedding_lr: Learning rate for token embeddings
+            matrix_lr: Learning rate for transformer matrices (Muon optimizer)
+            weight_decay: Weight decay coefficient
+
+        Returns:
+            List of optimizers [AdamW, Muon]
+        """
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
@@ -256,7 +326,20 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                kv_cache: Optional['KVCache'] = None, loss_reduction: str = 'mean') -> torch.Tensor:
+        """Forward pass through the GPT model.
+
+        Args:
+            idx: Input token indices of shape (B, T)
+            targets: Optional target token indices for training, shape (B, T)
+            kv_cache: Optional KV cache for efficient inference
+            loss_reduction: How to reduce the loss ('mean', 'sum', 'none')
+
+        Returns:
+            If targets provided: scalar loss tensor
+            If targets not provided: logits tensor of shape (B, T, vocab_size)
+        """
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -291,12 +374,21 @@ class GPT(nn.Module):
             return logits
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        """
-        Naive autoregressive streaming inference.
-        To make it super simple, let's assume:
-        - batch size is 1
-        - ids and the yielded tokens are simple Python lists and ints
+    def generate(self, tokens: List[int], max_tokens: int, temperature: float = 1.0,
+                top_k: Optional[int] = None, seed: int = 42) -> Generator[int, None, None]:
+        """Naive autoregressive streaming inference.
+
+        Assumes batch size is 1 for simplicity. Tokens are Python lists and ints.
+
+        Args:
+            tokens: Initial prompt tokens as list of integers
+            max_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature (0 = greedy, higher = more random)
+            top_k: Optional top-k sampling (only sample from top k tokens)
+            seed: Random seed for reproducibility
+
+        Yields:
+            Generated token IDs one at a time
         """
         assert isinstance(tokens, list)
         device = self.get_device()

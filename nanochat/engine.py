@@ -17,14 +17,27 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
+from typing import Optional, List, Tuple, Generator, Any
 from nanochat.common import compute_init
 from nanochat.checkpoint_manager import load_model
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
 @contextmanager
-def timeout(duration, formula):
-    def timeout_handler(signum, frame):
+def timeout(duration: int, formula: str) -> Generator[None, None, None]:
+    """Context manager for timing out operations.
+
+    Args:
+        duration: Timeout duration in seconds
+        formula: Formula being evaluated (for error message)
+
+    Yields:
+        None
+
+    Raises:
+        Exception: If operation times out
+    """
+    def timeout_handler(signum: int, frame: Any) -> None:
         raise Exception(f"'{formula}': timed out after {duration} seconds")
 
     signal.signal(signal.SIGALRM, timeout_handler)
@@ -32,7 +45,16 @@ def timeout(duration, formula):
     yield
     signal.alarm(0)
 
-def eval_with_timeout(formula, max_time=3):
+def eval_with_timeout(formula: str, max_time: int = 3) -> Optional[float]:
+    """Evaluate a Python expression with a timeout.
+
+    Args:
+        formula: Python expression to evaluate
+        max_time: Maximum time in seconds
+
+    Returns:
+        Result of evaluation or None if failed/timed out
+    """
     try:
         with timeout(max_time, formula):
             with warnings.catch_warnings():
@@ -43,8 +65,18 @@ def eval_with_timeout(formula, max_time=3):
         # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
         return None
 
-def use_calculator(expr):
-    """Evaluate a math expression safely."""
+def use_calculator(expr: str) -> Optional[float]:
+    """Evaluate a math expression safely with restrictions.
+
+    Only allows basic arithmetic operations with numbers.
+    Disallows: letters, power operator, imports, etc.
+
+    Args:
+        expr: Mathematical expression string
+
+    Returns:
+        Result of calculation or None if invalid/unsafe
+    """
     expr = expr.replace(",", "")
     if any([x not in "0123456789*+-/.() " for x in expr]): # for now disallow non-numeric chars
         return None
@@ -54,24 +86,32 @@ def use_calculator(expr):
 
 # -----------------------------------------------------------------------------
 class KVCache:
-    """
+    """Key-Value cache for efficient transformer inference.
+
     Works hand-in-hand with the GPT model to maintain the KV cache.
     Note that the .pos advances automatically after the last layer of the Transformer inserts.
+
+    Attributes:
+        kv_shape: Shape tuple for the cache tensor
+        kv_cache: The actual cache tensor (lazily initialized)
+        pos: Current position in the sequence
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
+    def __init__(self, batch_size: int, num_heads: int, seq_len: int, head_dim: int, num_layers: int):
         # Each of K/V is of shape (B, H, T, D) and we have one per layer of the Transformer.
         self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         self.kv_cache = None
         self.pos = 0 # current position in time in the cache
 
-    def reset(self):
+    def reset(self) -> None:
+        """Reset the cache position to 0."""
         self.pos = 0
 
-    def get_pos(self):
+    def get_pos(self) -> int:
+        """Get the current position in the cache."""
         return self.pos
 
-    def prefill(self, other):
+    def prefill(self, other: 'KVCache') -> None:
         """
         Prefill given another KV cache. Optionally expand along batch dim.
         This is used when we do batch 1 prefill and then want to generate
@@ -98,7 +138,17 @@ class KVCache:
         # 4) update the pos
         self.pos = other.pos
 
-    def insert_kv(self, layer_idx, k, v):
+    def insert_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Insert key/value tensors into the cache and return full views.
+
+        Args:
+            layer_idx: Layer index (0 to num_layers-1)
+            k: Key tensor of shape (B, H, T, D)
+            v: Value tensor of shape (B, H, T, D)
+
+        Returns:
+            Tuple of (key_view, value_view) containing all cached K/V up to current position
+        """
         # Lazy initialize the cache here because we need to know the dtype/device
         if self.kv_cache is None:
             self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
@@ -126,8 +176,19 @@ class KVCache:
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
-def sample_next_token(logits, rng, temperature=1.0, top_k=None):
-    """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
+def sample_next_token(logits: torch.Tensor, rng: torch.Generator,
+                     temperature: float = 1.0, top_k: Optional[int] = None) -> torch.Tensor:
+    """Sample a single next token from given logits.
+
+    Args:
+        logits: Logits tensor of shape (B, vocab_size)
+        rng: Random number generator for sampling
+        temperature: Sampling temperature (0 = greedy, higher = more random)
+        top_k: Optional top-k sampling restriction
+
+    Returns:
+        Token indices of shape (B, 1)
+    """
     assert temperature >= 0.0, "temperature must be non-negative"
     if temperature == 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
@@ -146,8 +207,17 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 # -----------------------------------------------------------------------------
 
 class RowState:
-    # Per-row state tracking during generation
-    def __init__(self, current_tokens=None):
+    """Per-row state tracking during generation.
+
+    Attributes:
+        current_tokens: Current token sequence for this row
+        forced_tokens: Queue of tokens to force inject (for tool use)
+        in_python_block: Whether currently inside a python block
+        python_expr_tokens: Tokens of the current python expression
+        completed: Whether this row has completed generation
+    """
+
+    def __init__(self, current_tokens: Optional[List[int]] = None):
         self.current_tokens = current_tokens or [] # Current token sequence for this row
         self.forced_tokens = deque() # Queue of tokens to force inject
         self.in_python_block = False # Whether we are inside a python block
@@ -155,14 +225,43 @@ class RowState:
         self.completed = False # Whether this row has completed generation
 
 class Engine:
+    """Efficient inference engine for GPT models with KV caching and tool use support.
 
-    def __init__(self, model, tokenizer):
+    Attributes:
+        model: The GPT model to use for inference
+        tokenizer: Tokenizer for encoding/decoding (needed for tool use)
+    """
+
+    def __init__(self, model: Any, tokenizer: Any):
+        """Initialize the engine.
+
+        Args:
+            model: GPT model instance
+            tokenizer: Tokenizer instance
+        """
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+    def generate(self, tokens: List[int], num_samples: int = 1, max_tokens: Optional[int] = None,
+                temperature: float = 1.0, top_k: Optional[int] = None, seed: int = 42) -> Generator[Tuple[List[int], List[int]], None, None]:
+        """Generate tokens efficiently with KV caching and parallel sampling.
+
+        Does single prefill and then clones the KV cache for multiple samples.
+
+        Args:
+            tokens: Initial prompt tokens as list of integers
+            num_samples: Number of parallel samples to generate
+            max_tokens: Maximum number of tokens to generate (None = unlimited)
+            temperature: Sampling temperature (0 = greedy, higher = more random)
+            top_k: Optional top-k sampling restriction
+            seed: Random seed for reproducibility
+
+        Yields:
+            Tuple of (token_column, token_masks) where:
+                - token_column: List of next tokens for each sample
+                - token_masks: List of masks (0=forced, 1=sampled) for each token
+        """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         rng = torch.Generator(device=device)
@@ -266,11 +365,19 @@ class Engine:
             # Prepare ids for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
 
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
-        """
-        Non-streaming batch generation that just returns the final token sequences.
-        Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
+    def generate_batch(self, tokens: List[int], num_samples: int = 1, **kwargs) -> Tuple[List[List[int]], List[List[int]]]:
+        """Non-streaming batch generation that returns final token sequences.
+
+        Args:
+            tokens: Initial prompt tokens as list of integers
+            num_samples: Number of parallel samples to generate
+            **kwargs: Additional arguments passed to generate()
+
+        Returns:
+            Tuple of (results, masks) where:
+                - results: List of token sequences (one per sample)
+                - masks: List of mask sequences (0=forced, 1=sampled)
+            Terminal tokens (assistant_end, bos) are not included.
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
