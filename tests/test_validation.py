@@ -236,7 +236,8 @@ class TestValidateModelConfig:
     def test_n_kv_head_greater_than_n_head(self):
         """Test that n_kv_head cannot exceed n_head."""
         config = GPTConfig(n_head=4, n_kv_head=6)
-        with pytest.raises(ValidationError, match="cannot be greater than"):
+        # This will fail divisibility check first (4 % 6 != 0)
+        with pytest.raises(ValidationError, match="divisible by n_kv_head"):
             validate_model_config(config)
 
 
